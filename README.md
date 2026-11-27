@@ -49,6 +49,29 @@ rsvg-convert -w 64 -h 64 assets/icon.svg -o assets/icon.png
 
 Only one Hermit runs at a time: starting it again while it is running just exits.
 
+### Telemetry
+
+Hermit reports traces, logs and metrics with [OpenTelemetry](https://opentelemetry.io/) over OTLP/HTTP: startup and hotkey/tray registration spans, its log lines (linked to those spans), and launcher metrics (`hermit.launcher.opens`, `hermit.launcher.open.duration`, `hermit.launcher.visible.duration`). About the machine it sends only the app version, OS and CPU architecture; file paths in log lines show the home directory as `~`, so user names are not sent.
+
+Each signal (traces, logs, metrics) goes to the first endpoint found for it:
+
+1. `OTEL_EXPORTER_OTLP_{TRACES,LOGS,METRICS}_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` at runtime.
+2. `HERMIT_OTLP_ENDPOINT` set at **compile time**, e.g. `HERMIT_OTLP_ENDPOINT=https://otel.example.com cargo build --release`.
+3. Debug builds only: `http://localhost:4318`.
+
+In a release build, a signal with no endpoint is not sent. `OTEL_SDK_DISABLED=true` turns telemetry off. Other standard `OTEL_*` variables (headers, `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_METRIC_EXPORT_INTERVAL`) work too; without a timeout variable each export gives up after 5 seconds.
+
+`RUST_LOG` controls what is printed to stderr; it does not change what is exported. By default that is `hermit=info,opentelemetry=warn`, so export failures show up. When a debug build only sends to the implicit `localhost:4318`, export failures are hidden (`opentelemetry=off`), so `cargo run` stays quiet without a collector.
+
+For local development, start a collector and [Jaeger](https://www.jaegertracing.io/):
+
+```sh
+docker compose up -d
+cargo run
+```
+
+Traces appear in the Jaeger UI at <http://localhost:16686> (service `hermit`). Jaeger stores traces only, so the collector prints logs and metrics instead: `docker compose logs -f otel-collector`. Metrics export every 60 seconds and on quit; run with `OTEL_METRIC_EXPORT_INTERVAL=5000` to see them sooner.
+
 ### Build and run
 
 ```sh
@@ -73,10 +96,14 @@ src/
   tray/          # Tray icon and menu: ksni (Linux), tray-icon crate (macOS, Windows)
   icon.rs        # Decodes the embedded app icon (assets/icon.png)
   single_instance.rs  # Lock file that keeps a second Hermit from starting
+  telemetry.rs   # tracing subscriber and OpenTelemetry (OTLP) exporters
 assets/
   icon.svg       # App and tray icon (source)
   icon.png       # 64px render of icon.svg, embedded in the binary
   hotkey/        # Global hotkey: XDG portal (Wayland), global-hotkey crate (macOS, Windows)
+dev/
+  otel-collector.yaml  # Collector config for the local telemetry stack
+compose.yaml     # Local OpenTelemetry Collector + Jaeger
 .agents/skills/  # Agent skills for AI coding assistants (gpui-kit guides)
 ```
 

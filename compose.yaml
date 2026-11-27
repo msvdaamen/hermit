@@ -1,0 +1,25 @@
+# Local telemetry backend for development: `docker compose up -d`, then run Hermit
+# with `cargo run` (debug builds export to http://localhost:4318 by default).
+#
+# - Jaeger UI (traces): http://localhost:16686
+# - Logs and metrics: `docker compose logs -f otel-collector`
+#
+# Hermit -> OpenTelemetry Collector (OTLP on 4317/4318) -> Jaeger.
+# Jaeger stores traces only, so the collector prints logs and metrics instead.
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.165.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./dev/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP (what Hermit uses)
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/jaeger:2.23.0
+    ports:
+      - "16686:16686" # UI
