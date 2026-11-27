@@ -99,7 +99,8 @@ pub(super) fn spawn(
 /// StatusNotifierItem pixmaps are ARGB32 in network byte order.
 fn to_ksni_icon(image: RgbaImage) -> ksni::Icon {
     let mut data = image.pixels;
-    for pixel in data.chunks_exact_mut(4) {
+    let (pixels, _) = data.as_chunks_mut::<4>();
+    for pixel in pixels {
         pixel.rotate_right(1); // [r, g, b, a] -> [a, r, g, b]
     }
     ksni::Icon {
