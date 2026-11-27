@@ -6,7 +6,8 @@
 //!
 //! 1. `OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` in the
 //!    environment at runtime;
-//! 2. `HERMIT_OTLP_ENDPOINT`, set in the environment when Hermit is compiled;
+//! 2. `HERMIT_OTLP_ENDPOINT`, set in the environment when Hermit is compiled, with
+//!    `HERMIT_OTLP_HEADERS` for its credentials;
 //! 3. in debug builds only, the local collector at `http://localhost:4318`
 //!    (`docker compose up` starts one, with Jaeger behind it).
 //!
@@ -16,6 +17,7 @@
 //! Exported data must not identify the user: log file system paths through
 //! [`private_path`].
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -26,7 +28,9 @@ use anyhow::Context as _;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{
+    LogExporter, MetricExporter, SpanExporter, WithExportConfig, WithHttpConfig,
+};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -38,9 +42,18 @@ use tracing_subscriber::prelude::*;
 /// The `service.name` every signal is reported under.
 const SERVICE_NAME: &str = "hermit";
 
-/// Base URL of the production collector, baked in at compile time. Unset for now:
-/// release builds export nothing until a backend is chosen.
+/// Base URL of the production backend, baked in at compile time, e.g.
+/// `https://otlp-gateway-prod-eu-west-4.grafana.net/otlp`. Release builds without it
+/// export nothing.
 const BUILT_IN_ENDPOINT: Option<&str> = option_env!("HERMIT_OTLP_ENDPOINT");
+
+/// Headers for [`BUILT_IN_ENDPOINT`], baked in at compile time, in the
+/// `OTEL_EXPORTER_OTLP_HEADERS` format: `key=value` pairs separated by commas, values
+/// URL-encoded (`Authorization=Basic%20<credentials>`). Sent only to that endpoint.
+///
+/// Anything compiled in can be read out of the binary: use a token that can only
+/// write telemetry.
+const BUILT_IN_HEADERS: Option<&str> = option_env!("HERMIT_OTLP_HEADERS");
 
 /// Where debug builds send telemetry when nothing else is configured.
 const LOCAL_COLLECTOR: &str = "http://localhost:4318";
@@ -348,9 +361,21 @@ fn has_timeout_variable(signal: Signal, env: impl Fn(&str) -> Option<String>) ->
     .any(|name| env(name).is_some_and(|value| !value.trim().is_empty()))
 }
 
+/// Splits `OTEL_EXPORTER_OTLP_HEADERS`-style `key=value,key=value` pairs. Values stay
+/// URL-encoded; the exporter decodes them.
+fn parse_headers(input: &str) -> HashMap<String, String> {
+    input
+        .split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .filter(|(key, _)| !key.is_empty())
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
 /// Applies the shared settings to a signal's exporter builder, or returns `None`
 /// when the signal is not exported.
-fn configure<B: WithExportConfig>(
+fn configure<B: WithExportConfig + WithHttpConfig>(
     builder: B,
     signal: Signal,
     endpoint: &Endpoint,
@@ -364,9 +389,14 @@ fn configure<B: WithExportConfig>(
     } else {
         builder.with_timeout(EXPORT_TIMEOUT)
     };
-    Some(match endpoint.url(signal) {
+    let builder = match endpoint.url(signal) {
         Some(url) => builder.with_endpoint(url),
         None => builder,
+    };
+    // Only the built-in endpoint gets the built-in credentials, never one set at runtime.
+    Some(match (endpoint, BUILT_IN_HEADERS) {
+        (Endpoint::BuiltIn(_), Some(headers)) => builder.with_headers(parse_headers(headers)),
+        _ => builder,
     })
 }
 
@@ -483,7 +513,9 @@ fn host_arch() -> &'static str {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{Endpoint, Endpoints, PrivatePath, Signal, has_timeout_variable, signal_url};
+    use super::{
+        Endpoint, Endpoints, PrivatePath, Signal, has_timeout_variable, parse_headers, signal_url,
+    };
 
     fn env_of<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + Copy + 'a {
         |name| {
@@ -555,6 +587,14 @@ mod tests {
             signal_url("https://otel.example.com/", Signal::Traces),
             "https://otel.example.com/v1/traces"
         );
+    }
+
+    #[test]
+    fn headers_are_split_into_pairs() {
+        let headers = parse_headers(" Authorization=Basic%20abc= , X-Scope = team ,junk,=x");
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers["Authorization"], "Basic%20abc=");
+        assert_eq!(headers["X-Scope"], "team");
     }
 
     #[test]

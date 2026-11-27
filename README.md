@@ -56,7 +56,7 @@ Hermit reports traces, logs and metrics with [OpenTelemetry](https://opentelemet
 Each signal (traces, logs, metrics) goes to the first endpoint found for it:
 
 1. `OTEL_EXPORTER_OTLP_{TRACES,LOGS,METRICS}_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` at runtime.
-2. `HERMIT_OTLP_ENDPOINT` set at **compile time**, e.g. `HERMIT_OTLP_ENDPOINT=https://otel.example.com cargo build --release`.
+2. `HERMIT_OTLP_ENDPOINT` set at **compile time**, with `HERMIT_OTLP_HEADERS` for its credentials (see [Grafana Cloud](#grafana-cloud) below).
 3. Debug builds only: `http://localhost:4318`.
 
 In a release build, a signal with no endpoint is not sent. `OTEL_SDK_DISABLED=true` turns telemetry off. Other standard `OTEL_*` variables (headers, `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_METRIC_EXPORT_INTERVAL`) work too; without a timeout variable each export gives up after 5 seconds.
@@ -71,6 +71,20 @@ cargo run
 ```
 
 Traces appear in the Jaeger UI at <http://localhost:16686> (service `hermit`). Jaeger stores traces only, so the collector prints logs and metrics instead: `docker compose logs -f otel-collector`. Metrics export every 60 seconds and on quit; run with `OTEL_METRIC_EXPORT_INTERVAL=5000` to see them sooner.
+
+#### Grafana Cloud
+
+Release builds send telemetry straight to Grafana Cloud's OTLP endpoint. Get the endpoint and instance ID from your stack's **OpenTelemetry** tile in the Grafana Cloud portal. Then create a token under **Administration → Users and access → Cloud access policies**, with a policy that only has `metrics:write`, `logs:write` and `traces:write` on that one stack.
+
+```sh
+HERMIT_OTLP_ENDPOINT=https://otlp-gateway-prod-<region>.grafana.net/otlp \
+HERMIT_OTLP_HEADERS="Authorization=Basic%20$(printf '%s' '<instance id>:<token>' | base64 -w0)" \
+cargo build --release
+```
+
+The token is compiled into the binary, and anyone with a copy of Hermit can extract it. That is why it may only write telemetry: it cannot read data or change the account, but it could be used to send junk data into the stack. If that happens, revoke it and build with a new one. The built-in headers are sent only to the built-in endpoint, never to one set with `OTEL_EXPORTER_OTLP_*`.
+
+To try Grafana Cloud from a debug build, set the same values at runtime instead: `OTEL_EXPORTER_OTLP_ENDPOINT=…` and `OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20…"`. Data shows up in Grafana under service `hermit`: traces in Tempo, logs in Loki, metrics in Mimir.
 
 ### Build and run
 
