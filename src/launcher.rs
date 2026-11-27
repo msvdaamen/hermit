@@ -8,7 +8,7 @@ actions!(launcher, [Dismiss]);
 const CONTEXT: &str = "Launcher";
 
 /// The launcher window, if one has been opened. The handle may be stale when the
-/// window closed itself (Escape, focus loss); [`toggle`] handles that case.
+/// window closed itself (Escape, focus loss); [`toggle`] and [`show`] handle that.
 #[derive(Default)]
 struct LauncherWindow(Option<AnyWindowHandle>);
 
@@ -21,15 +21,20 @@ pub fn init(cx: &mut App) {
 
 /// Opens the launcher, or closes it when it is already open.
 pub fn toggle(cx: &mut App) {
-    if let Some(handle) = cx.global_mut::<LauncherWindow>().0.take() {
-        // `update` fails when the window has already closed itself; open a new one then.
-        if handle
-            .update(cx, |_, window, _| window.remove_window())
-            .is_ok()
-        {
-            log::debug!("launcher closed");
-            return;
-        }
+    if !close(cx) {
+        show(cx);
+    }
+}
+
+/// Opens the launcher unless it is already open.
+pub fn show(cx: &mut App) {
+    // `update` fails when the window has closed itself; the handle is stale then.
+    let is_open = cx
+        .global::<LauncherWindow>()
+        .0
+        .is_some_and(|handle| handle.update(cx, |_, _, _| ()).is_ok());
+    if is_open {
+        return;
     }
 
     match open(cx) {
@@ -39,6 +44,20 @@ pub fn toggle(cx: &mut App) {
         }
         Err(error) => log::error!("failed to open the launcher window: {error:#}"),
     }
+}
+
+/// Closes the launcher. Returns whether it was open.
+fn close(cx: &mut App) -> bool {
+    let Some(handle) = cx.global_mut::<LauncherWindow>().0.take() else {
+        return false;
+    };
+    let closed = handle
+        .update(cx, |_, window, _| window.remove_window())
+        .is_ok();
+    if closed {
+        log::debug!("launcher closed");
+    }
+    closed
 }
 
 fn open(cx: &mut App) -> Result<AnyWindowHandle> {

@@ -9,9 +9,12 @@ env_logger = "0.11.12"
 futures = "0.3.34"
 gpui-kit = { version = "0.11.0", default-features = false, features = ["component", "assets", "gpui-fast"] }
 log = "0.4.35"
+png = "0.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts"] }
+ksni = { version = "0.3", default-features = false, features = ["async-io"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 global-hotkey = "0.10.0"
+tray-icon = "0.27"

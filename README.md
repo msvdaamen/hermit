@@ -4,7 +4,7 @@ A fast, keyboard-driven launcher for **Linux (Wayland), macOS and Windows**, ins
 
 Raycast is a great productivity tool, but it doesn't run on Linux. Hermit aims to bring the same experience to every platform: press a hotkey, type a few characters, and get things done without reaching for the mouse.
 
-> **Status:** early development. Hermit runs in the background and a global hotkey toggles a placeholder window. Everything else listed under [Goals](#goals) is planned, not yet built.
+> **Status:** early development. Hermit runs in the background with a tray icon, and a global hotkey toggles a placeholder window. Everything else listed under [Goals](#goals) is planned, not yet built.
 
 ## Goals
 
@@ -37,6 +37,18 @@ Hermit starts in the background with no window. Press the hotkey to open the lau
 - **macOS:** `Option+Space`.
 - **Windows:** `Alt+Space`. This replaces Windows' own Alt+Space window menu, as PowerToys Run does.
 
+### Tray icon
+
+While Hermit runs, its icon sits in the system tray (the notification area, next to apps like Steam). Left-click it to open the launcher; right-click it for **Open Hermit** and **Quit**. On Linux the tray needs a StatusNotifierItem host: KDE Plasma has one built in, while GNOME needs the AppIndicator extension.
+
+The icon's source is `assets/icon.svg`. After editing it, re-render the PNG the app embeds:
+
+```sh
+rsvg-convert -w 64 -h 64 assets/icon.svg -o assets/icon.png
+```
+
+Only one Hermit runs at a time: starting it again while it is running just exits.
+
 ### Build and run
 
 ```sh
@@ -58,6 +70,12 @@ cargo build --release
 src/
   main.rs        # Application entry point
   launcher.rs    # The launcher window, toggled by the hotkey
+  tray/          # Tray icon and menu: ksni (Linux), tray-icon crate (macOS, Windows)
+  icon.rs        # Decodes the embedded app icon (assets/icon.png)
+  single_instance.rs  # Lock file that keeps a second Hermit from starting
+assets/
+  icon.svg       # App and tray icon (source)
+  icon.png       # 64px render of icon.svg, embedded in the binary
   hotkey/        # Global hotkey: XDG portal (Wayland), global-hotkey crate (macOS, Windows)
 .agents/skills/  # Agent skills for AI coding assistants (gpui-kit guides)
 ```

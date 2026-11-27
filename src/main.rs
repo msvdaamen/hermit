@@ -2,7 +2,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod hotkey;
+mod icon;
 mod launcher;
+mod single_instance;
+mod tray;
 
 use gpui_kit::*;
 
@@ -15,6 +18,13 @@ struct HotkeyRegistration {
 }
 
 impl Global for HotkeyRegistration {}
+
+/// Keeps the tray icon visible for the lifetime of the application.
+struct TrayRegistration {
+    _icon: tray::TrayIcon,
+}
+
+impl Global for TrayRegistration {}
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("hermit=info"))
@@ -30,6 +40,20 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Held until the process exits. A lock that cannot be taken for another reason
+    // (e.g. an unwritable directory) should not stop Hermit from starting.
+    let _instance_lock = match single_instance::acquire() {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            log::info!("Hermit is already running.");
+            return;
+        }
+        Err(error) => {
+            log::warn!("could not check for a running Hermit: {error:#}");
+            None
+        }
+    };
+
     application()
         .with_assets(assets::Assets)
         // Hermit lives in the background: closing the launcher must not quit the app.
@@ -37,6 +61,14 @@ fn main() {
         .run(|cx| {
             init(cx);
             launcher::init(cx);
+
+            match tray::spawn(cx, |action, cx| match action {
+                tray::TrayAction::Open => launcher::show(cx),
+                tray::TrayAction::Quit => cx.quit(),
+            }) {
+                Ok(icon) => cx.set_global(TrayRegistration { _icon: icon }),
+                Err(error) => log::error!("could not show the tray icon: {error:#}"),
+            }
 
             match hotkey::listen(cx, launcher::toggle) {
                 Ok(listener) => {

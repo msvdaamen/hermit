@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Hermit: a spiral shell (a hermit crab's home, and a command shell)
+       that unwinds into a baseline, like a prompt waiting for input. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5B5FF0"/>
+      <stop offset="1" stop-color="#9B3FE8"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.18"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#tile)"/>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#sheen)"/>
+  <rect x="2.5" y="2.5" width="59" height="59" rx="13.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.12"/>
+
+  <!-- Baseline, then three half turns winding inward: radii 16, 10 and 5. -->
+  <path d="M12 48 H36 A16 16 0 0 0 36 16 A10 10 0 0 0 36 36 A5 5 0 0 0 36 26"
+        fill="none" stroke="#FFFFFF" stroke-width="6"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
