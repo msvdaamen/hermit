@@ -84,7 +84,7 @@ cargo build --release
 
 The token is compiled into the binary, and anyone with a copy of Hermit can extract it. That is why it may only write telemetry: it cannot read data or change the account, but it could be used to send junk data into the stack. If that happens, revoke it and build with a new one. The built-in headers are sent only to the built-in endpoint, never to one set with `OTEL_EXPORTER_OTLP_*`.
 
-To try Grafana Cloud from a debug build, set the same values at runtime instead: `OTEL_EXPORTER_OTLP_ENDPOINT=…` and `OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20…"`. Data shows up in Grafana under service `hermit`: traces in Tempo, logs in Loki, metrics in Mimir.
+To try Grafana Cloud from a debug build, set the same values at runtime instead, as `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS`. The easiest place is a `.env` file: debug builds load it at startup from the working directory or a parent (release builds never do). Copy [`.env.example`](.env.example) to `.env`, which git ignores, and fill it in. Variables already set in your shell take precedence, and while `.env` sets an endpoint, `cargo run` sends to Grafana Cloud instead of the local collector. Data shows up in Grafana under service `hermit`: traces in Tempo, logs in Loki, metrics in Mimir.
 
 ### Build and run
 

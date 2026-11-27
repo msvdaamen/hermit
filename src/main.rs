@@ -28,7 +28,23 @@ struct TrayRegistration {
 impl Global for TrayRegistration {}
 
 fn main() {
+    // Debug builds read local settings, such as Grafana Cloud credentials, from a
+    // `.env` file in the working directory or a parent. Variables already set in the
+    // environment win. Runs first: it sets environment variables, which is only sound
+    // while no other thread exists.
+    let dotenv = cfg!(debug_assertions).then(dotenvy::dotenv);
+
     let mut telemetry = telemetry::init();
+
+    match dotenv {
+        Some(Ok(path)) => {
+            tracing::info!("loaded settings from {}", telemetry::private_path(&path));
+        }
+        Some(Err(error)) if !error.not_found() => {
+            tracing::warn!("could not load .env: {error}");
+        }
+        Some(Err(_)) | None => {}
+    }
 
     // GPUI is built with its Wayland backend only; without a compositor it would
     // silently start headless, with no way to show the launcher.

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.105"
+dotenvy = "0.15.7"
 futures = "0.3.34"
 gpui-kit = { version = "0.11.0", default-features = false, features = ["component", "assets", "gpui-fast"] }
 opentelemetry = "0.33.1"
@@ -24,8 +25,3 @@ ksni = { version = "0.3", default-features = false, features = ["async-io"] }
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 global-hotkey = "0.10.0"
 tray-icon = "0.27"
-
-# GPUI, wgpu and naga are far slower unoptimized: in a debug build the launcher took
-# ~150 ms to open instead of ~15 ms. Hermit's own code stays unoptimized for debugging.
-[profile.dev.package."*"]
-opt-level = 3
