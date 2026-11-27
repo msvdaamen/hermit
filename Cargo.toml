@@ -1,0 +1,17 @@
+[package]
+name = "hermit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.105"
+env_logger = "0.11.12"
+futures = "0.3.34"
+gpui-kit = { version = "0.11.0", default-features = false, features = ["component", "assets", "gpui-fast"] }
+log = "0.4.35"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+global-hotkey = "0.10.0"
