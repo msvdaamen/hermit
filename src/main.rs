@@ -30,7 +30,7 @@ impl Global for TrayRegistration {}
 fn main() {
     let dotenv = cfg!(debug_assertions).then(dotenvy::dotenv);
 
-    let mut telemetry = telemetry::init();
+    let telemetry = telemetry::init();
 
     match dotenv {
         Some(Ok(path)) => {
@@ -50,7 +50,7 @@ fn main() {
             "Hermit needs a Wayland session (WAYLAND_DISPLAY is not set); X11 is not supported."
         );
         // `exit` skips destructors, so flush explicitly.
-        telemetry.shutdown();
+        drop(telemetry);
         std::process::exit(1);
     }
 

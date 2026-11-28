@@ -297,11 +297,7 @@ fn scrub_event(mut event: Event<'static>, home: Option<&Path>) -> Event<'static>
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-
-    use sentry::protocol::{DebugImage, DebugMeta, Event, SymbolicDebugImage};
-
-    use super::{DsnSource, PrivatePath, resolve_dsn, scrub_event};
+    use super::{DsnSource, resolve_dsn};
 
     const DSN: &str = "https://key@o1.ingest.sentry.io/2";
 
@@ -345,70 +341,77 @@ mod tests {
         assert_eq!(resolve_dsn(env_of(&[]), Some("")), None);
     }
 
+    /// Unix paths only: on Windows, the part after `~` is joined with `\`.
     #[cfg(unix)]
-    #[test]
-    fn crash_reports_hide_home_directory() {
-        let image = |name: &str| {
-            DebugImage::Symbolic(SymbolicDebugImage {
-                name: name.to_owned(),
-                arch: None,
-                image_addr: 0.into(),
-                image_size: 0,
-                image_vmaddr: 0.into(),
-                id: Default::default(),
-                code_id: None,
-                debug_file: None,
-            })
-        };
-        let event = Event {
-            debug_meta: std::borrow::Cow::Owned(DebugMeta {
-                images: vec![
-                    image("/home/alice/.local/bin/hermit"),
-                    image("/usr/lib/libc.so.6"),
-                ],
-                ..DebugMeta::default()
-            }),
-            ..Event::default()
-        };
+    mod paths {
+        use std::path::{Path, PathBuf};
 
-        let event = scrub_event(event, Some(Path::new("/home/alice")));
-        let names: Vec<_> = event
-            .debug_meta
-            .images
-            .iter()
-            .filter_map(|image| match image {
-                DebugImage::Symbolic(image) => Some(image.name.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(names, ["~/.local/bin/hermit", "/usr/lib/libc.so.6"]);
-    }
+        use sentry::protocol::{DebugImage, DebugMeta, Event, SymbolicDebugImage};
 
-    fn private(path: &str, home: &str) -> String {
-        PrivatePath {
-            path: Path::new(path),
-            home: Some(PathBuf::from(home)),
+        use super::super::{PrivatePath, scrub_event};
+
+        #[test]
+        fn crash_reports_hide_home_directory() {
+            let image = |name: &str| {
+                DebugImage::Symbolic(SymbolicDebugImage {
+                    name: name.to_owned(),
+                    arch: None,
+                    image_addr: 0.into(),
+                    image_size: 0,
+                    image_vmaddr: 0.into(),
+                    id: Default::default(),
+                    code_id: None,
+                    debug_file: None,
+                })
+            };
+            let event = Event {
+                debug_meta: std::borrow::Cow::Owned(DebugMeta {
+                    images: vec![
+                        image("/home/alice/.local/bin/hermit"),
+                        image("/usr/lib/libc.so.6"),
+                    ],
+                    ..DebugMeta::default()
+                }),
+                ..Event::default()
+            };
+
+            let event = scrub_event(event, Some(Path::new("/home/alice")));
+            let names: Vec<_> = event
+                .debug_meta
+                .images
+                .iter()
+                .filter_map(|image| match image {
+                    DebugImage::Symbolic(image) => Some(image.name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names, ["~/.local/bin/hermit", "/usr/lib/libc.so.6"]);
         }
-        .to_string()
-    }
 
-    #[cfg(unix)]
-    #[test]
-    fn private_path_hides_home_directory() {
-        assert_eq!(
-            private("/home/alice/.local/share/applications", "/home/alice"),
-            "~/.local/share/applications"
-        );
-        assert_eq!(private("/home/alice", "/home/alice"), "~");
-    }
+        fn private(path: &str, home: &str) -> String {
+            PrivatePath {
+                path: Path::new(path),
+                home: Some(PathBuf::from(home)),
+            }
+            .to_string()
+        }
 
-    #[cfg(unix)]
-    #[test]
-    fn private_path_keeps_paths_outside_home() {
-        assert_eq!(
-            private("/run/user/1000/hermit.lock", "/home/alice"),
-            "/run/user/1000/hermit.lock"
-        );
-        assert_eq!(private("/home/alice2/x", "/home/alice"), "/home/alice2/x");
+        #[test]
+        fn private_path_hides_home_directory() {
+            assert_eq!(
+                private("/home/alice/.local/share/applications", "/home/alice"),
+                "~/.local/share/applications"
+            );
+            assert_eq!(private("/home/alice", "/home/alice"), "~");
+        }
+
+        #[test]
+        fn private_path_keeps_paths_outside_home() {
+            assert_eq!(
+                private("/run/user/1000/hermit.lock", "/home/alice"),
+                "/run/user/1000/hermit.lock"
+            );
+            assert_eq!(private("/home/alice2/x", "/home/alice"), "/home/alice2/x");
+        }
     }
 }
