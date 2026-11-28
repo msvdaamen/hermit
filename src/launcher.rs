@@ -195,7 +195,6 @@ fn layer_shell_kind() -> WindowKind {
 }
 
 struct LauncherView {
-    focus_handle: FocusHandle,
     /// What the user is searching for.
     query: Entity<InputState>,
     opened_at: Instant,
@@ -209,9 +208,8 @@ struct LauncherView {
 
 impl LauncherView {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let focus_handle = cx.focus_handle();
-
-        // The launcher opens ready to type into.
+        // The launcher opens ready to type into. Nothing else in it takes focus, so
+        // clicking elsewhere in the window leaves the search field focused.
         let query =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search apps and commands…"));
         window.focus(&query.focus_handle(cx), cx);
@@ -229,7 +227,6 @@ impl LauncherView {
         });
 
         Self {
-            focus_handle,
             query,
             opened_at: Instant::now(),
             close_reason: None,
@@ -258,8 +255,10 @@ impl Drop for LauncherView {
 
 impl Render for LauncherView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // No `track_focus` here: a focusable root would take focus from the search
+        // field on every click. Escape reaches `dismiss` through the field, which
+        // lets it propagate when there is nothing to clear.
         v_flex()
-            .track_focus(&self.focus_handle)
             .key_context(CONTEXT)
             .on_action(cx.listener(Self::dismiss))
             .size_full()

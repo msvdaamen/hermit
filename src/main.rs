@@ -7,6 +7,7 @@ mod icon;
 mod launcher;
 mod single_instance;
 mod telemetry;
+mod termination;
 mod theme;
 mod tray;
 
@@ -89,6 +90,7 @@ fn main() {
                 }
             })
             .detach();
+            termination::quit_on_signal(cx);
 
             let _startup = tracing::info_span!("startup").entered();
             init(cx);
