@@ -1,11 +1,11 @@
 //! The launcher window: opened and closed by the global hotkey.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::*;
-use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Histogram};
+
+use crate::telemetry::metrics;
 
 actions!(launcher, [Dismiss]);
 
@@ -55,50 +55,16 @@ impl CloseReason {
 /// window closed itself (Escape, focus loss); [`toggle`] and [`show`] handle that.
 struct LauncherWindow {
     handle: Option<AnyWindowHandle>,
-    metrics: LauncherMetrics,
+    /// Whether a launcher window has opened since Hermit started.
+    has_opened: bool,
 }
 
 impl Global for LauncherWindow {}
 
-/// The launcher's instruments, created once from the global meter provider (a
-/// no-op when telemetry is off).
-#[derive(Clone)]
-struct LauncherMetrics {
-    opens: Counter<u64>,
-    open_duration: Histogram<f64>,
-    visible_duration: Histogram<f64>,
-}
-
-impl LauncherMetrics {
-    fn new() -> Self {
-        let meter = opentelemetry::global::meter("hermit");
-        Self {
-            opens: meter
-                .u64_counter("hermit.launcher.opens")
-                .with_description("Times the launcher window was opened")
-                .build(),
-            open_duration: meter
-                .f64_histogram("hermit.launcher.open.duration")
-                .with_description("Time to create the launcher window")
-                .with_unit("s")
-                .with_boundaries(vec![
-                    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0, 2.5,
-                ])
-                .build(),
-            visible_duration: meter
-                .f64_histogram("hermit.launcher.visible.duration")
-                .with_description("How long the launcher stayed open")
-                .with_unit("s")
-                .with_boundaries(vec![0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 1800.0])
-                .build(),
-        }
-    }
-}
-
 pub fn init(cx: &mut App) {
     cx.set_global(LauncherWindow {
         handle: None,
-        metrics: LauncherMetrics::new(),
+        has_opened: false,
     });
     cx.bind_keys([KeyBinding::new("escape", Dismiss, Some(CONTEXT))]);
 }
@@ -121,27 +87,43 @@ pub fn show(trigger: Trigger, cx: &mut App) {
         return;
     }
 
-    let span = tracing::info_span!(
-        "launcher.show",
-        trigger = trigger.as_str(),
-        window.kind = tracing::field::Empty,
-    )
+    // Every show creates a new window, but the first one also sets up the GPU
+    // renderer and takes far longer. A separate span name keeps it from skewing
+    // the timings of `launcher.show`.
+    let is_first = !cx.global::<LauncherWindow>().has_opened;
+    let span = if is_first {
+        tracing::info_span!(
+            "launcher.first_show",
+            trigger = trigger.as_str(),
+            window.kind = tracing::field::Empty,
+        )
+    } else {
+        tracing::info_span!(
+            "launcher.show",
+            trigger = trigger.as_str(),
+            window.kind = tracing::field::Empty,
+        )
+    }
     .entered();
-    let metrics = cx.global::<LauncherWindow>().metrics.clone();
     let started = Instant::now();
-    match open(metrics.visible_duration, cx) {
+    match open(cx) {
         Ok((handle, kind)) => {
             span.record("window.kind", kind);
             let attributes = [
-                KeyValue::new("trigger", trigger.as_str()),
-                KeyValue::new("window.kind", kind),
+                ("trigger", trigger.as_str()),
+                ("window.kind", kind),
+                ("first_open", if is_first { "true" } else { "false" }),
             ];
-            metrics.opens.add(1, &attributes);
-            metrics
-                .open_duration
-                .record(started.elapsed().as_secs_f64(), &attributes);
+            metrics::count("hermit.launcher.opens", &attributes);
+            metrics::duration(
+                "hermit.launcher.open.duration",
+                started.elapsed(),
+                &attributes,
+            );
             tracing::debug!("launcher opened");
-            cx.global_mut::<LauncherWindow>().handle = Some(handle);
+            let launcher = cx.global_mut::<LauncherWindow>();
+            launcher.handle = Some(handle);
+            launcher.has_opened = true;
         }
         Err(error) => tracing::error!("failed to open the launcher window: {error:#}"),
     }
@@ -162,14 +144,12 @@ fn close(cx: &mut App) -> bool {
 }
 
 /// Opens the window, returning it and its `window.kind` attribute.
-fn open(visible_duration: Histogram<f64>, cx: &mut App) -> Result<(AnyWindowHandle, &'static str)> {
-    let build = move |window: &mut Window, cx: &mut App| {
-        cx.new(|cx| LauncherView::new(visible_duration, window, cx))
-    };
+fn open(cx: &mut App) -> Result<(AnyWindowHandle, &'static str)> {
+    let build = |window: &mut Window, cx: &mut App| cx.new(|cx| LauncherView::new(window, cx));
 
     // Not every compositor implements layer shell (GNOME does not).
     #[cfg(target_os = "linux")]
-    match open_window(window_options(layer_shell_kind(), cx), cx, build.clone()) {
+    match open_window(window_options(layer_shell_kind(), cx), cx, build) {
         Ok((handle, _)) => return Ok((handle, "layer_shell")),
         Err(error) => {
             tracing::warn!("layer-shell window unavailable, using a popup window: {error:#}")
@@ -213,7 +193,6 @@ struct LauncherView {
     opened_at: Instant,
     /// Set when the view closes its own window; anything else is [`CloseReason::Toggled`].
     close_reason: Option<CloseReason>,
-    visible_duration: Histogram<f64>,
     /// Set once the window has gained focus, so the deactivation that can precede
     /// the first activation does not close the window immediately.
     was_active: bool,
@@ -221,7 +200,7 @@ struct LauncherView {
 }
 
 impl LauncherView {
-    fn new(visible_duration: Histogram<f64>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
@@ -239,7 +218,6 @@ impl LauncherView {
             focus_handle,
             opened_at: Instant::now(),
             close_reason: None,
-            visible_duration,
             was_active: false,
             _activation: activation,
         }
@@ -255,10 +233,10 @@ impl LauncherView {
 impl Drop for LauncherView {
     fn drop(&mut self) {
         let reason = self.close_reason.unwrap_or(CloseReason::Toggled);
-        let visible: Duration = self.opened_at.elapsed();
-        self.visible_duration.record(
-            visible.as_secs_f64(),
-            &[KeyValue::new("close.reason", reason.as_str())],
+        metrics::duration(
+            "hermit.launcher.visible.duration",
+            self.opened_at.elapsed(),
+            &[("close.reason", reason.as_str())],
         );
     }
 }

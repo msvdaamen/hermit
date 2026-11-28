@@ -51,40 +51,26 @@ Only one Hermit runs at a time: starting it again while it is running just exits
 
 ### Telemetry
 
-Hermit reports traces, logs and metrics with [OpenTelemetry](https://opentelemetry.io/) over OTLP/HTTP: startup and hotkey/tray registration spans, its log lines (linked to those spans), and launcher metrics (`hermit.launcher.opens`, `hermit.launcher.open.duration`, `hermit.launcher.visible.duration`). About the machine it sends only the app version, OS and CPU architecture; file paths in log lines show the home directory as `~`, so user names are not sent.
+Hermit reports to [Sentry](https://sentry.io/): crashes (panics), errors, traces (startup, hotkey and tray registration, opening the launcher), its log lines (linked to those traces), release-health sessions, and launcher metrics (`hermit.launcher.opens`, `hermit.launcher.open.duration`, `hermit.launcher.visible.duration`). Code records spans and events with [`tracing`](https://docs.rs/tracing); `src/telemetry.rs` routes them to Sentry, and is the only place that uses the Sentry SDK. Metrics go through `telemetry::metrics`, because `tracing` has no metrics API.
 
-Each signal (traces, logs, metrics) goes to the first endpoint found for it:
+About the machine, Hermit sends the app version, OS and version, and CPU architecture; it does not send the host name or IP address. File paths in log lines and crash reports show the home directory as `~`, so user names are not sent.
 
-1. `OTEL_EXPORTER_OTLP_{TRACES,LOGS,METRICS}_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` at runtime.
-2. `HERMIT_OTLP_ENDPOINT` set at **compile time**, with `HERMIT_OTLP_HEADERS` for its credentials (see [Grafana Cloud](#grafana-cloud) below).
-3. Debug builds only: `http://localhost:4318`.
+Hermit sends to the first DSN it finds:
 
-In a release build, a signal with no endpoint is not sent. `OTEL_SDK_DISABLED=true` turns telemetry off. Other standard `OTEL_*` variables (headers, `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_METRIC_EXPORT_INTERVAL`) work too; without a timeout variable each export gives up after 5 seconds.
+1. `SENTRY_DSN` at runtime. Set but empty, it turns telemetry off, even in a build with a built-in DSN.
+2. `HERMIT_SENTRY_DSN` set at **compile time**:
 
-`RUST_LOG` controls what is printed to stderr; it does not change what is exported. By default that is `hermit=info,opentelemetry=warn`, so export failures show up. When a debug build only sends to the implicit `localhost:4318`, export failures are hidden (`opentelemetry=off`), so `cargo run` stays quiet without a collector.
+   ```sh
+   HERMIT_SENTRY_DSN=https://<key>@<org>.ingest.<region>.sentry.io/<project> cargo build --release
+   ```
 
-For local development, start a collector and [Jaeger](https://www.jaegertracing.io/):
+Without either, nothing is sent. Find the DSN in Sentry under **Settings → Projects → hermit → Client Keys (DSN)**. A DSN can only send events, but anyone with a copy of Hermit can read it out of the binary and send junk to the project. Sentry's per-key rate limits (on the same page) cap the damage; if it gets abused, revoke the key and build with a new one.
 
-```sh
-docker compose up -d
-cargo run
-```
+Events are tagged with environment `development` in debug builds and `production` in release builds (`SENTRY_ENVIRONMENT` overrides it), and with release `hermit@<version>`. Spans and logs from Hermit's own code are sent at `debug` and above in debug builds, `info` and above in release builds; `error!` events also open Sentry issues. Debug builds send every trace, release builds a random 10% (sampled per trace, so a trace arrives whole or not at all). Errors, crashes, logs and metrics are always sent in full.
 
-Traces appear in the Jaeger UI at <http://localhost:16686> (service `hermit`). Jaeger stores traces only, so the collector prints logs and metrics instead: `docker compose logs -f otel-collector`. Metrics export every 60 seconds and on quit; run with `OTEL_METRIC_EXPORT_INTERVAL=5000` to see them sooner.
+`RUST_LOG` controls what is printed to stderr (default `hermit=info`); it does not change what is sent.
 
-#### Grafana Cloud
-
-Release builds send telemetry straight to Grafana Cloud's OTLP endpoint. Get the endpoint and instance ID from your stack's **OpenTelemetry** tile in the Grafana Cloud portal. Then create a token under **Administration → Users and access → Cloud access policies**, with a policy that only has `metrics:write`, `logs:write` and `traces:write` on that one stack.
-
-```sh
-HERMIT_OTLP_ENDPOINT=https://otlp-gateway-prod-<region>.grafana.net/otlp \
-HERMIT_OTLP_HEADERS="Authorization=Basic%20$(printf '%s' '<instance id>:<token>' | base64 -w0)" \
-cargo build --release
-```
-
-The token is compiled into the binary, and anyone with a copy of Hermit can extract it. That is why it may only write telemetry: it cannot read data or change the account, but it could be used to send junk data into the stack. If that happens, revoke it and build with a new one. The built-in headers are sent only to the built-in endpoint, never to one set with `OTEL_EXPORTER_OTLP_*`.
-
-To try Grafana Cloud from a debug build, set the same values at runtime instead, as `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS`. The easiest place is a `.env` file: debug builds load it at startup from the working directory or a parent (release builds never do). Copy [`.env.example`](.env.example) to `.env`, which git ignores, and fill it in. Variables already set in your shell take precedence, and while `.env` sets an endpoint, `cargo run` sends to Grafana Cloud instead of the local collector. Data shows up in Grafana under service `hermit`: traces in Tempo, logs in Loki, metrics in Mimir.
+To send from a debug build, put a DSN in `.env`: debug builds load it at startup from the working directory or a parent (release builds never do). Copy [`.env.example`](.env.example) to `.env`, which git ignores, and fill it in. Variables already set in your shell take precedence. Use a separate Sentry project for development, or filter by the `development` environment.
 
 ### Build and run
 
@@ -110,14 +96,11 @@ src/
   tray/          # Tray icon and menu: ksni (Linux), tray-icon crate (macOS, Windows)
   icon.rs        # Decodes the embedded app icon (assets/icon.png)
   single_instance.rs  # Lock file that keeps a second Hermit from starting
-  telemetry.rs   # tracing subscriber and OpenTelemetry (OTLP) exporters
+  hotkey/        # Global hotkey: XDG portal (Wayland), global-hotkey crate (macOS, Windows)
+  telemetry.rs   # tracing subscriber and Sentry
 assets/
   icon.svg       # App and tray icon (source)
   icon.png       # 64px render of icon.svg, embedded in the binary
-  hotkey/        # Global hotkey: XDG portal (Wayland), global-hotkey crate (macOS, Windows)
-dev/
-  otel-collector.yaml  # Collector config for the local telemetry stack
-compose.yaml     # Local OpenTelemetry Collector + Jaeger
 .agents/skills/  # Agent skills for AI coding assistants (gpui-kit guides)
 ```
 

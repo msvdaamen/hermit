@@ -28,10 +28,6 @@ struct TrayRegistration {
 impl Global for TrayRegistration {}
 
 fn main() {
-    // Debug builds read local settings, such as Grafana Cloud credentials, from a
-    // `.env` file in the working directory or a parent. Variables already set in the
-    // environment win. Runs first: it sets environment variables, which is only sound
-    // while no other thread exists.
     let dotenv = cfg!(debug_assertions).then(dotenvy::dotenv);
 
     let mut telemetry = telemetry::init();

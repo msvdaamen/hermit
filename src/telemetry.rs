@@ -1,23 +1,21 @@
-//! Logging and OpenTelemetry: traces, logs and metrics exported over OTLP/HTTP.
+//! Logging and Sentry: errors, crashes, traces, logs and metrics.
 //!
-//! Hermit always prints its own log lines to stderr, filtered by `RUST_LOG`. It also
-//! exports each signal (traces, logs, metrics) to the first endpoint it finds for
-//! that signal:
+//! Code records telemetry through `tracing`: spans become Sentry transactions and
+//! spans, events become Sentry logs, and `error!` events also become Sentry issues.
+//! Panics are reported as crashes. Metrics have no `tracing` API and go through
+//! [`metrics`] instead.
 //!
-//! 1. `OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` in the
-//!    environment at runtime;
-//! 2. `HERMIT_OTLP_ENDPOINT`, set in the environment when Hermit is compiled, with
-//!    `HERMIT_OTLP_HEADERS` for its credentials;
-//! 3. in debug builds only, the local collector at `http://localhost:4318`
-//!    (`docker compose up` starts one, with Jaeger behind it).
+//! Hermit always prints its own log lines to stderr, filtered by `RUST_LOG`. It sends
+//! telemetry to the first DSN it finds:
 //!
-//! In a release build, a signal with none of these is not exported. `OTEL_SDK_DISABLED=true`
-//! turns export off in any build.
+//! 1. `SENTRY_DSN` in the environment at runtime (set but empty turns sending off);
+//! 2. `HERMIT_SENTRY_DSN`, set in the environment when Hermit is compiled.
 //!
-//! Exported data must not identify the user: log file system paths through
+//! Without either, nothing is sent.
+//!
+//! Sent data must not identify the user: log file system paths through
 //! [`private_path`].
 
-use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -25,81 +23,62 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use opentelemetry::KeyValue;
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{
-    LogExporter, MetricExporter, SpanExporter, WithExportConfig, WithHttpConfig,
-};
-use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::logs::SdkLoggerProvider;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
-use opentelemetry_sdk::trace::SdkTracerProvider;
+use sentry::integrations::tracing::{ErrorLayer, LogLayer, SpanLayer};
+use sentry::protocol::{DebugImage, Event};
+use sentry::types::Dsn;
+use sentry::{ClientInitGuard, ClientOptions, SessionMode};
 use tracing::Level;
 use tracing_subscriber::filter::{EnvFilter, Targets};
 use tracing_subscriber::prelude::*;
 
-/// The `service.name` every signal is reported under.
+/// Reported as the server name, in place of the host name Sentry would send.
 const SERVICE_NAME: &str = "hermit";
 
-/// Base URL of the production backend, baked in at compile time, e.g.
-/// `https://otlp-gateway-prod-eu-west-4.grafana.net/otlp`. Release builds without it
-/// export nothing.
-const BUILT_IN_ENDPOINT: Option<&str> = option_env!("HERMIT_OTLP_ENDPOINT");
+/// The production DSN, baked in at compile time. Builds without it send nothing
+/// unless `SENTRY_DSN` is set. A DSN only allows sending events, but it can be read
+/// out of the binary: anyone can send to it.
+const BUILT_IN_DSN: Option<&str> = option_env!("HERMIT_SENTRY_DSN");
 
-/// Headers for [`BUILT_IN_ENDPOINT`], baked in at compile time, in the
-/// `OTEL_EXPORTER_OTLP_HEADERS` format: `key=value` pairs separated by commas, values
-/// URL-encoded (`Authorization=Basic%20<credentials>`). Sent only to that endpoint.
-///
-/// Anything compiled in can be read out of the binary: use a token that can only
-/// write telemetry.
-const BUILT_IN_HEADERS: Option<&str> = option_env!("HERMIT_OTLP_HEADERS");
-
-/// Where debug builds send telemetry when nothing else is configured.
-const LOCAL_COLLECTOR: &str = "http://localhost:4318";
-
-/// Per request, unless an `OTEL_EXPORTER_OTLP_*TIMEOUT` variable says otherwise.
-/// Short, so a dead collector cannot hold a batch for long.
-const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long quitting waits for the last batches to go out.
+/// How long quitting waits for the last events to go out.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Stderr filter when `RUST_LOG` is unset. The exporters report failures under the
-/// `opentelemetry*` targets.
-const DEFAULT_LOG_FILTER: &str = "hermit=info,opentelemetry=warn";
+/// Stderr filter when `RUST_LOG` is unset.
+const DEFAULT_LOG_FILTER: &str = "hermit=info";
 
-/// Stderr filter when `RUST_LOG` is unset and telemetry only goes to the implicit
-/// local collector. Without one running, every batch would print an export failure.
-const LOCAL_LOG_FILTER: &str = "hermit=info,opentelemetry=off";
-
-/// Keeps the exporters running; dropping it flushes and stops them.
+/// Keeps the Sentry client running; dropping it flushes and stops it.
 #[must_use = "telemetry stops when this is dropped"]
 pub struct Telemetry {
-    providers: Option<Providers>,
+    client: Option<ClientInitGuard>,
 }
 
 impl Telemetry {
-    /// Flushes pending telemetry and stops exporting. Waits at most
+    /// Ends the session, sends pending telemetry and stops sending. Waits at most
     /// [`SHUTDOWN_TIMEOUT`]; later calls do nothing.
     pub fn shutdown(&mut self) {
-        let Some(providers) = self.providers.take() else {
+        let Some(client) = self.client.take() else {
             return;
         };
+        // The session lives on this thread's hub, not the one the thread below gets.
+        sentry::end_session();
 
-        // Exporting is blocking HTTP: run it off this thread so an unreachable
-        // endpoint cannot stall quitting.
+        // Sending is blocking HTTP: run it off this thread so an unreachable server
+        // cannot stall quitting.
         let (done, finished) = mpsc::channel();
         let spawned = thread::Builder::new()
             .name("telemetry-shutdown".to_owned())
             .spawn(move || {
-                providers.shutdown();
+                drop(client);
                 // The receiver is gone only when shutdown already timed out.
                 done.send(()).ok();
             });
         match spawned {
             Ok(_) => {
-                if finished.recv_timeout(SHUTDOWN_TIMEOUT).is_err() {
+                // A little longer than the client's own timeout, which it applies to
+                // the queue and not to a request already in flight.
+                if finished
+                    .recv_timeout(SHUTDOWN_TIMEOUT + Duration::from_millis(500))
+                    .is_err()
+                {
                     tracing::warn!(
                         timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
                         "telemetry did not flush in time"
@@ -117,71 +96,48 @@ impl Drop for Telemetry {
     }
 }
 
-/// Installs the global `tracing` subscriber and, when an endpoint is configured,
-/// the OpenTelemetry exporters. Records from the `log` crate (GPUI and other
-/// dependencies) are routed through `tracing` too.
+/// Installs the global `tracing` subscriber and, when a DSN is configured, the
+/// Sentry client. Records from the `log` crate (GPUI and other dependencies) are
+/// routed through `tracing` too.
 ///
 /// # Panics
 ///
 /// When a global `tracing` subscriber or `log` logger is already installed.
 pub fn init() -> Telemetry {
     let env = |name: &str| std::env::var(name).ok();
-    let endpoints = Endpoints::resolve(env, BUILT_IN_ENDPOINT, cfg!(debug_assertions));
-    let providers = if endpoints.is_off() {
-        Ok(None)
-    } else {
-        Providers::new(&endpoints, env).map(Some)
+    let dsn = resolve_dsn(env, BUILT_IN_DSN).map(|(dsn, source)| {
+        dsn.parse::<Dsn>()
+            .map(|dsn| (dsn, source))
+            .with_context(|| format!("{source} is not a valid Sentry DSN"))
+    });
+    let client = match &dsn {
+        Some(Ok((dsn, _))) => Some(sentry::init(client_options(dsn.clone()))),
+        Some(Err(_)) | None => None,
     };
 
-    let default_filter = if endpoints.is_local_only() {
-        LOCAL_LOG_FILTER
-    } else {
-        DEFAULT_LOG_FILTER
-    };
     let stderr_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
-    let export_layer = providers
-        .as_ref()
-        .ok()
-        .and_then(Option::as_ref)
-        .map(|providers| {
-            tracing_opentelemetry::layer()
-                .with_tracer(providers.tracer.tracer(SERVICE_NAME))
-                .and_then(OpenTelemetryTracingBridge::new(&providers.logger))
-                // Only Hermit's own spans and events. Exporting the exporters' own
-                // diagnostics (HTTP client, OpenTelemetry) would feed back into itself.
-                .with_filter(Targets::new().with_target(env!("CARGO_CRATE_NAME"), export_level()))
-        });
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    let sentry_layer = client.as_ref().map(|_| {
+        SpanLayer::new()
+            .with_filter(own(export_level()))
+            .and_then(LogLayer::new().with_filter(own(export_level())))
+            .and_then(ErrorLayer::new().with_filter(own(Level::ERROR)))
+    });
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_filter(stderr_filter))
-        .with(export_layer)
+        .with(sentry_layer)
         .init();
 
-    let providers = match providers {
-        Ok(Some(providers)) => {
-            opentelemetry::global::set_meter_provider(providers.meter.clone());
-            tracing::info!(
-                traces = %endpoints.traces,
-                logs = %endpoints.logs,
-                metrics = %endpoints.metrics,
-                "exporting telemetry"
-            );
-            Some(providers)
-        }
-        Ok(None) => {
-            tracing::debug!("telemetry export is off");
-            None
-        }
-        Err(error) => {
-            tracing::warn!("could not start telemetry export: {error:#}");
-            None
-        }
-    };
-    Telemetry { providers }
+    match dsn {
+        Some(Ok((_, source))) => tracing::info!(dsn = %source, "sending telemetry to Sentry"),
+        Some(Err(error)) => tracing::warn!("telemetry is off: {error:#}"),
+        None => tracing::debug!("telemetry is off: no Sentry DSN"),
+    }
+    Telemetry { client }
 }
 
 /// Formats `path` with the user's home directory replaced by `~`, so log lines
-/// (which are exported) do not carry the user name.
+/// (which are sent) do not carry the user name.
 pub fn private_path(path: &Path) -> PrivatePath<'_> {
     PrivatePath {
         path,
@@ -212,7 +168,43 @@ impl fmt::Display for PrivatePath<'_> {
     }
 }
 
-/// Spans and log events at this level and above are exported.
+/// Product metrics, sent to Sentry. `tracing` has no metrics API, so these are the
+/// one kind of telemetry not recorded through it. They do nothing while telemetry is
+/// off.
+pub mod metrics {
+    use std::time::Duration;
+
+    use sentry::protocol::Unit;
+
+    /// Attributes to filter and group a metric by. Keep them low-cardinality and free
+    /// of anything that identifies the user.
+    pub type Attributes<'a> = &'a [(&'static str, &'static str)];
+
+    /// Counts one occurrence of `name`.
+    pub fn count(name: &'static str, attributes: Attributes<'_>) {
+        attributes
+            .iter()
+            .fold(
+                sentry::metrics::counter(name, 1),
+                |metric, &(key, value)| metric.attribute(key, value),
+            )
+            .capture();
+    }
+
+    /// Records how long something named `name` took.
+    pub fn duration(name: &'static str, duration: Duration, attributes: Attributes<'_>) {
+        let milliseconds = duration.as_secs_f64() * 1000.0;
+        attributes
+            .iter()
+            .fold(
+                sentry::metrics::distribution(name, milliseconds).unit(Unit::Millisecond),
+                |metric, &(key, value)| metric.attribute(key, value),
+            )
+            .capture();
+    }
+}
+
+/// Spans and log events at this level and above are sent.
 fn export_level() -> Level {
     if cfg!(debug_assertions) {
         Level::DEBUG
@@ -221,303 +213,99 @@ fn export_level() -> Level {
     }
 }
 
-/// An OpenTelemetry signal, each with its own exporter and configuration.
+/// The share of traces sent: all of them in debug builds, 10% in release builds.
+/// Sampling is per trace, so a trace is sent whole or not at all. Errors, logs and
+/// metrics are not sampled.
+fn traces_sample_rate() -> f32 {
+    if cfg!(debug_assertions) { 1.0 } else { 0.1 }
+}
+
+/// Hermit's own spans and events at `level` and above. Sending other crates' events
+/// would also send the HTTP client's diagnostics about sending them.
+fn own(level: Level) -> Targets {
+    Targets::new().with_target(env!("CARGO_CRATE_NAME"), level)
+}
+
+/// Where the DSN came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Signal {
-    Traces,
-    Logs,
-    Metrics,
-}
-
-impl Signal {
-    /// The lowercase name used in OTLP paths (`/v1/traces`).
-    fn name(self) -> &'static str {
-        match self {
-            Self::Traces => "traces",
-            Self::Logs => "logs",
-            Self::Metrics => "metrics",
-        }
-    }
-
-    /// This signal's variant of an exporter variable, such as
-    /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` for `setting` `ENDPOINT`.
-    fn variable(self, setting: &str) -> String {
-        format!(
-            "OTEL_EXPORTER_OTLP_{}_{setting}",
-            self.name().to_ascii_uppercase()
-        )
-    }
-}
-
-/// Where one signal goes.
-#[derive(Debug, PartialEq, Eq)]
-enum Endpoint {
-    /// Configured through `OTEL_EXPORTER_OTLP_*` variables, which the exporter reads.
+enum DsnSource {
     Environment,
-    /// The compile-time base URL.
-    BuiltIn(&'static str),
-    /// Debug builds' fallback, [`LOCAL_COLLECTOR`].
-    Local,
-    /// Not exported.
-    Off,
+    BuiltIn,
 }
 
-impl Endpoint {
-    fn resolve(
-        signal: Signal,
-        env: impl Fn(&str) -> Option<String>,
-        built_in: Option<&'static str>,
-        is_debug_build: bool,
-    ) -> Self {
-        let is_set = |name: &str| env(name).is_some_and(|value| !value.trim().is_empty());
-
-        if env("OTEL_SDK_DISABLED").is_some_and(|value| value.trim().eq_ignore_ascii_case("true")) {
-            return Self::Off;
-        }
-        if is_set(&signal.variable("ENDPOINT")) || is_set("OTEL_EXPORTER_OTLP_ENDPOINT") {
-            return Self::Environment;
-        }
-        match built_in.filter(|base| !base.trim().is_empty()) {
-            Some(base) => Self::BuiltIn(base),
-            None if is_debug_build => Self::Local,
-            None => Self::Off,
-        }
-    }
-
-    /// The URL to set on the exporter, or `None` when it reads its own configuration.
-    fn url(&self, signal: Signal) -> Option<String> {
-        match self {
-            Self::BuiltIn(base) => Some(signal_url(base, signal)),
-            Self::Local => Some(signal_url(LOCAL_COLLECTOR, signal)),
-            Self::Environment | Self::Off => None,
-        }
-    }
-}
-
-impl fmt::Display for Endpoint {
+impl fmt::Display for DsnSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Environment => f.write_str("OTEL_EXPORTER_OTLP_*"),
-            Self::BuiltIn(base) => f.write_str(base),
-            Self::Local => f.write_str(LOCAL_COLLECTOR),
-            Self::Off => f.write_str("off"),
-        }
-    }
-}
-
-/// Each signal's endpoint.
-#[derive(Debug, PartialEq, Eq)]
-struct Endpoints {
-    traces: Endpoint,
-    logs: Endpoint,
-    metrics: Endpoint,
-}
-
-impl Endpoints {
-    fn resolve(
-        env: impl Fn(&str) -> Option<String>,
-        built_in: Option<&'static str>,
-        is_debug_build: bool,
-    ) -> Self {
-        let resolve = |signal| Endpoint::resolve(signal, &env, built_in, is_debug_build);
-        Self {
-            traces: resolve(Signal::Traces),
-            logs: resolve(Signal::Logs),
-            metrics: resolve(Signal::Metrics),
-        }
-    }
-
-    fn all(&self) -> [&Endpoint; 3] {
-        [&self.traces, &self.logs, &self.metrics]
-    }
-
-    fn is_off(&self) -> bool {
-        self.all()
-            .iter()
-            .all(|endpoint| **endpoint == Endpoint::Off)
-    }
-
-    /// Whether every exported signal goes to the implicit local collector.
-    fn is_local_only(&self) -> bool {
-        self.all()
-            .iter()
-            .all(|endpoint| matches!(endpoint, Endpoint::Local | Endpoint::Off))
-    }
-}
-
-/// The OTLP/HTTP URL for `signal` under `base`.
-fn signal_url(base: &str, signal: Signal) -> String {
-    format!("{}/v1/{}", base.trim_end_matches('/'), signal.name())
-}
-
-/// Whether the environment sets the export timeout for `signal`; a timeout set in
-/// code would override it.
-fn has_timeout_variable(signal: Signal, env: impl Fn(&str) -> Option<String>) -> bool {
-    [
-        signal.variable("TIMEOUT"),
-        "OTEL_EXPORTER_OTLP_TIMEOUT".to_owned(),
-    ]
-    .iter()
-    .any(|name| env(name).is_some_and(|value| !value.trim().is_empty()))
-}
-
-/// Splits `OTEL_EXPORTER_OTLP_HEADERS`-style `key=value,key=value` pairs. Values stay
-/// URL-encoded; the exporter decodes them.
-fn parse_headers(input: &str) -> HashMap<String, String> {
-    input
-        .split(',')
-        .filter_map(|pair| pair.split_once('='))
-        .map(|(key, value)| (key.trim(), value.trim()))
-        .filter(|(key, _)| !key.is_empty())
-        .map(|(key, value)| (key.to_owned(), value.to_owned()))
-        .collect()
-}
-
-/// Applies the shared settings to a signal's exporter builder, or returns `None`
-/// when the signal is not exported.
-fn configure<B: WithExportConfig + WithHttpConfig>(
-    builder: B,
-    signal: Signal,
-    endpoint: &Endpoint,
-    env: impl Fn(&str) -> Option<String>,
-) -> Option<B> {
-    if *endpoint == Endpoint::Off {
-        return None;
-    }
-    let builder = if has_timeout_variable(signal, env) {
-        builder
-    } else {
-        builder.with_timeout(EXPORT_TIMEOUT)
-    };
-    let builder = match endpoint.url(signal) {
-        Some(url) => builder.with_endpoint(url),
-        None => builder,
-    };
-    // Only the built-in endpoint gets the built-in credentials, never one set at runtime.
-    Some(match (endpoint, BUILT_IN_HEADERS) {
-        (Endpoint::BuiltIn(_), Some(headers)) => builder.with_headers(parse_headers(headers)),
-        _ => builder,
-    })
-}
-
-/// The SDK pipelines. Each batches on its own background thread, so none needs
-/// an async runtime. A signal that is not exported keeps a provider without an
-/// exporter, which drops its data.
-struct Providers {
-    tracer: SdkTracerProvider,
-    logger: SdkLoggerProvider,
-    meter: SdkMeterProvider,
-}
-
-impl Providers {
-    fn new(
-        endpoints: &Endpoints,
-        env: impl Fn(&str) -> Option<String> + Copy,
-    ) -> anyhow::Result<Self> {
-        let resource = resource();
-
-        let mut tracer = SdkTracerProvider::builder().with_resource(resource.clone());
-        if let Some(builder) = configure(
-            SpanExporter::builder().with_http(),
-            Signal::Traces,
-            &endpoints.traces,
-            env,
-        ) {
-            let exporter = builder.build().context("creating the span exporter")?;
-            tracer = tracer.with_batch_exporter(exporter);
-        }
-
-        let mut logger = SdkLoggerProvider::builder().with_resource(resource.clone());
-        if let Some(builder) = configure(
-            LogExporter::builder().with_http(),
-            Signal::Logs,
-            &endpoints.logs,
-            env,
-        ) {
-            let exporter = builder.build().context("creating the log exporter")?;
-            logger = logger.with_batch_exporter(exporter);
-        }
-
-        let mut meter = SdkMeterProvider::builder().with_resource(resource);
-        if let Some(builder) = configure(
-            MetricExporter::builder().with_http(),
-            Signal::Metrics,
-            &endpoints.metrics,
-            env,
-        ) {
-            let exporter = builder.build().context("creating the metric exporter")?;
-            // Exports every 60 s, or per `OTEL_METRIC_EXPORT_INTERVAL` (milliseconds).
-            meter = meter.with_periodic_exporter(exporter);
-        }
-
-        Ok(Self {
-            tracer: tracer.build(),
-            logger: logger.build(),
-            meter: meter.build(),
+        f.write_str(match self {
+            Self::Environment => "SENTRY_DSN",
+            Self::BuiltIn => "the built-in DSN",
         })
     }
+}
 
-    fn shutdown(self) {
-        // Spans first: log records and metrics may refer to them.
-        if let Err(error) = self.tracer.shutdown() {
-            tracing::warn!(%error, "could not flush spans");
+/// The DSN to send to, or `None` when telemetry is off.
+fn resolve_dsn(
+    env: impl Fn(&str) -> Option<String>,
+    built_in: Option<&'static str>,
+) -> Option<(String, DsnSource)> {
+    match env("SENTRY_DSN") {
+        // Set but empty turns sending off, even in a build with a built-in DSN.
+        Some(dsn) => {
+            let dsn = dsn.trim();
+            (!dsn.is_empty()).then(|| (dsn.to_owned(), DsnSource::Environment))
         }
-        if let Err(error) = self.logger.shutdown() {
-            tracing::warn!(%error, "could not flush log records");
-        }
-        if let Err(error) = self.meter.shutdown() {
-            tracing::warn!(%error, "could not flush metrics");
-        }
+        None => built_in
+            .map(str::trim)
+            .filter(|dsn| !dsn.is_empty())
+            .map(|dsn| (dsn.to_owned(), DsnSource::BuiltIn)),
     }
 }
 
-/// Describes this Hermit build. Deliberately leaves out anything that identifies
-/// the user or the machine (host name, user name, paths).
-fn resource() -> Resource {
-    Resource::builder()
-        .with_service_name(SERVICE_NAME)
-        .with_attributes([
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-            KeyValue::new(
-                "deployment.environment.name",
-                if cfg!(debug_assertions) {
-                    "development"
-                } else {
-                    "production"
-                },
-            ),
-            KeyValue::new("os.type", os_type()),
-            KeyValue::new("host.arch", host_arch()),
-        ])
-        .build()
+/// The environment defaults to `development` in debug builds and `production` in
+/// release builds; `SENTRY_ENVIRONMENT` overrides it.
+fn client_options(dsn: Dsn) -> ClientOptions {
+    let mut options = ClientOptions::new()
+        .maybe_release(sentry::release_name!())
+        .server_name(SERVICE_NAME)
+        .send_default_pii(false)
+        // One session per run, for crash-free rates per release.
+        .auto_session_tracking(true)
+        .session_mode(SessionMode::Application)
+        .traces_sample_rate(traces_sample_rate())
+        .shutdown_timeout(SHUTDOWN_TIMEOUT)
+        .before_send({
+            let home = std::env::home_dir();
+            move |event| Some(scrub_event(event, home.as_deref()))
+        });
+    options.dsn = Some(dsn);
+    options
 }
 
-/// `os.type` as the semantic conventions spell it.
-fn os_type() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
+/// Removes the home directory from the paths of the loaded libraries that crash
+/// reports list, which would carry the user name when Hermit is installed under it.
+fn scrub_event(mut event: Event<'static>, home: Option<&Path>) -> Event<'static> {
+    for image in &mut event.debug_meta.to_mut().images {
+        if let DebugImage::Symbolic(image) = image {
+            image.name = PrivatePath {
+                path: Path::new(&image.name),
+                home: home.map(Path::to_path_buf),
+            }
+            .to_string();
+        }
     }
-}
-
-/// `host.arch` as the semantic conventions spell it.
-fn host_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => other,
-    }
+    event
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{
-        Endpoint, Endpoints, PrivatePath, Signal, has_timeout_variable, parse_headers, signal_url,
-    };
+    use sentry::protocol::{DebugImage, DebugMeta, Event, SymbolicDebugImage};
 
-    fn env_of<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + Copy + 'a {
+    use super::{DsnSource, PrivatePath, resolve_dsn, scrub_event};
+
+    const DSN: &str = "https://key@o1.ingest.sentry.io/2";
+
+    fn env_of<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
         |name| {
             vars.iter()
                 .find(|(key, _)| *key == name)
@@ -526,82 +314,74 @@ mod tests {
     }
 
     #[test]
-    fn runtime_variable_overrides_built_in_endpoint() {
-        let env = [("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")];
-        let endpoints = Endpoints::resolve(env_of(&env), Some("https://otel.example.com"), false);
-        assert_eq!(endpoints.traces, Endpoint::Environment);
-        assert_eq!(endpoints.metrics, Endpoint::Environment);
-    }
-
-    #[test]
-    fn per_signal_variable_configures_only_that_signal() {
-        let env = [(
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-            "http://jaeger:4318/v1/traces",
-        )];
-        let endpoints = Endpoints::resolve(env_of(&env), None, false);
+    fn runtime_dsn_overrides_built_in_dsn() {
+        let env = [("SENTRY_DSN", " https://other@example.com/1 ")];
         assert_eq!(
-            endpoints,
-            Endpoints {
-                traces: Endpoint::Environment,
-                logs: Endpoint::Off,
-                metrics: Endpoint::Off,
-            }
+            resolve_dsn(env_of(&env), Some(DSN)),
+            Some((
+                "https://other@example.com/1".to_owned(),
+                DsnSource::Environment
+            ))
         );
     }
 
     #[test]
-    fn built_in_endpoint_is_used_without_variables() {
-        let endpoints = Endpoints::resolve(env_of(&[]), Some("https://otel.example.com"), false);
+    fn built_in_dsn_is_used_without_variable() {
         assert_eq!(
-            endpoints.logs,
-            Endpoint::BuiltIn("https://otel.example.com")
+            resolve_dsn(env_of(&[]), Some(DSN)),
+            Some((DSN.to_owned(), DsnSource::BuiltIn))
         );
     }
 
     #[test]
-    fn debug_build_falls_back_to_local_collector() {
-        let endpoints = Endpoints::resolve(env_of(&[]), None, true);
-        assert_eq!(endpoints.traces, Endpoint::Local);
-        assert!(endpoints.is_local_only());
+    fn empty_runtime_dsn_turns_telemetry_off() {
+        let env = [("SENTRY_DSN", "  ")];
+        assert_eq!(resolve_dsn(env_of(&env), Some(DSN)), None);
     }
 
     #[test]
-    fn release_build_without_endpoint_exports_nothing() {
-        let env = [("OTEL_EXPORTER_OTLP_ENDPOINT", "  ")];
-        assert!(Endpoints::resolve(env_of(&env), Some(""), false).is_off());
+    fn no_dsn_means_off() {
+        assert_eq!(resolve_dsn(env_of(&[]), None), None);
+        assert_eq!(resolve_dsn(env_of(&[]), Some("")), None);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn sdk_disabled_wins() {
-        let env = [
-            ("OTEL_SDK_DISABLED", "TRUE"),
-            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
-        ];
-        assert!(Endpoints::resolve(env_of(&env), None, true).is_off());
-    }
+    fn crash_reports_hide_home_directory() {
+        let image = |name: &str| {
+            DebugImage::Symbolic(SymbolicDebugImage {
+                name: name.to_owned(),
+                arch: None,
+                image_addr: 0.into(),
+                image_size: 0,
+                image_vmaddr: 0.into(),
+                id: Default::default(),
+                code_id: None,
+                debug_file: None,
+            })
+        };
+        let event = Event {
+            debug_meta: std::borrow::Cow::Owned(DebugMeta {
+                images: vec![
+                    image("/home/alice/.local/bin/hermit"),
+                    image("/usr/lib/libc.so.6"),
+                ],
+                ..DebugMeta::default()
+            }),
+            ..Event::default()
+        };
 
-    #[test]
-    fn signal_url_appends_path_once() {
-        assert_eq!(
-            signal_url("https://otel.example.com/", Signal::Traces),
-            "https://otel.example.com/v1/traces"
-        );
-    }
-
-    #[test]
-    fn headers_are_split_into_pairs() {
-        let headers = parse_headers(" Authorization=Basic%20abc= , X-Scope = team ,junk,=x");
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers["Authorization"], "Basic%20abc=");
-        assert_eq!(headers["X-Scope"], "team");
-    }
-
-    #[test]
-    fn timeout_variables_are_detected_per_signal() {
-        let env = [("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", "30000")];
-        assert!(has_timeout_variable(Signal::Logs, env_of(&env)));
-        assert!(!has_timeout_variable(Signal::Traces, env_of(&env)));
+        let event = scrub_event(event, Some(Path::new("/home/alice")));
+        let names: Vec<_> = event
+            .debug_meta
+            .images
+            .iter()
+            .filter_map(|image| match image {
+                DebugImage::Symbolic(image) => Some(image.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["~/.local/bin/hermit", "/usr/lib/libc.so.6"]);
     }
 
     fn private(path: &str, home: &str) -> String {
