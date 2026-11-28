@@ -18,7 +18,7 @@ pub(super) fn listen(
     let manager = GlobalHotKeyManager::new()?;
     let hotkey = HotKey::new(Some(MODIFIERS), Code::Space);
     manager.register(hotkey)?;
-    log::info!("global hotkey registered: {hotkey}");
+    tracing::info!("global hotkey registered: {hotkey}");
 
     // The handler runs on the crate's event thread; forward presses to the main thread.
     let (sender, mut presses) = futures::channel::mpsc::unbounded();

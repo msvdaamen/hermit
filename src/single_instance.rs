@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 
+use crate::telemetry::private_path;
+
 /// Held for as long as this process is the running instance.
 #[must_use = "the lock is released when this is dropped"]
 pub struct InstanceLock {
@@ -23,13 +25,13 @@ pub fn acquire() -> anyhow::Result<Option<InstanceLock>> {
         .truncate(false)
         .write(true)
         .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+        .with_context(|| format!("opening {}", private_path(&path)))?;
 
     match file.try_lock() {
         Ok(()) => Ok(Some(InstanceLock { _file: file })),
         Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(error)) => {
-            Err(error).with_context(|| format!("locking {}", path.display()))
+            Err(error).with_context(|| format!("locking {}", private_path(&path)))
         }
     }
 }

@@ -1,76 +1,163 @@
 //! The launcher window: opened and closed by the global hotkey.
 
+use std::time::Instant;
+
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::*;
+
+use crate::telemetry::metrics;
 
 actions!(launcher, [Dismiss]);
 
 const CONTEXT: &str = "Launcher";
 
+/// What asked for the launcher. Recorded on its spans and metrics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    /// The global hotkey.
+    Hotkey,
+    /// The tray icon or its menu.
+    Tray,
+    /// Startup, when no hotkey could be registered.
+    Startup,
+}
+
+impl Trigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hotkey => "hotkey",
+            Self::Tray => "tray",
+            Self::Startup => "startup",
+        }
+    }
+}
+
+/// How the launcher was closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseReason {
+    Escape,
+    FocusLost,
+    /// Closed from outside: the hotkey toggled it, or Hermit quit.
+    Toggled,
+}
+
+impl CloseReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Escape => "escape",
+            Self::FocusLost => "focus_lost",
+            Self::Toggled => "toggled",
+        }
+    }
+}
+
 /// The launcher window, if one has been opened. The handle may be stale when the
 /// window closed itself (Escape, focus loss); [`toggle`] and [`show`] handle that.
-#[derive(Default)]
-struct LauncherWindow(Option<AnyWindowHandle>);
+struct LauncherWindow {
+    handle: Option<AnyWindowHandle>,
+    /// Whether a launcher window has opened since Hermit started.
+    has_opened: bool,
+}
 
 impl Global for LauncherWindow {}
 
 pub fn init(cx: &mut App) {
-    cx.set_global(LauncherWindow::default());
+    cx.set_global(LauncherWindow {
+        handle: None,
+        has_opened: false,
+    });
     cx.bind_keys([KeyBinding::new("escape", Dismiss, Some(CONTEXT))]);
 }
 
 /// Opens the launcher, or closes it when it is already open.
-pub fn toggle(cx: &mut App) {
+pub fn toggle(trigger: Trigger, cx: &mut App) {
     if !close(cx) {
-        show(cx);
+        show(trigger, cx);
     }
 }
 
 /// Opens the launcher unless it is already open.
-pub fn show(cx: &mut App) {
+pub fn show(trigger: Trigger, cx: &mut App) {
     // `update` fails when the window has closed itself; the handle is stale then.
     let is_open = cx
         .global::<LauncherWindow>()
-        .0
+        .handle
         .is_some_and(|handle| handle.update(cx, |_, _, _| ()).is_ok());
     if is_open {
         return;
     }
 
+    // Every show creates a new window, but the first one also sets up the GPU
+    // renderer and takes far longer. A separate span name keeps it from skewing
+    // the timings of `launcher.show`.
+    let is_first = !cx.global::<LauncherWindow>().has_opened;
+    let span = if is_first {
+        tracing::info_span!(
+            "launcher.first_show",
+            trigger = trigger.as_str(),
+            window.kind = tracing::field::Empty,
+        )
+    } else {
+        tracing::info_span!(
+            "launcher.show",
+            trigger = trigger.as_str(),
+            window.kind = tracing::field::Empty,
+        )
+    }
+    .entered();
+    let started = Instant::now();
     match open(cx) {
-        Ok(handle) => {
-            log::debug!("launcher opened");
-            cx.global_mut::<LauncherWindow>().0 = Some(handle);
+        Ok((handle, kind)) => {
+            span.record("window.kind", kind);
+            let attributes = [
+                ("trigger", trigger.as_str()),
+                ("window.kind", kind),
+                ("first_open", if is_first { "true" } else { "false" }),
+            ];
+            metrics::count("hermit.launcher.opens", &attributes);
+            metrics::duration(
+                "hermit.launcher.open.duration",
+                started.elapsed(),
+                &attributes,
+            );
+            tracing::debug!("launcher opened");
+            let launcher = cx.global_mut::<LauncherWindow>();
+            launcher.handle = Some(handle);
+            launcher.has_opened = true;
         }
-        Err(error) => log::error!("failed to open the launcher window: {error:#}"),
+        Err(error) => tracing::error!("failed to open the launcher window: {error:#}"),
     }
 }
 
 /// Closes the launcher. Returns whether it was open.
 fn close(cx: &mut App) -> bool {
-    let Some(handle) = cx.global_mut::<LauncherWindow>().0.take() else {
+    let Some(handle) = cx.global_mut::<LauncherWindow>().handle.take() else {
         return false;
     };
     let closed = handle
         .update(cx, |_, window, _| window.remove_window())
         .is_ok();
     if closed {
-        log::debug!("launcher closed");
+        tracing::debug!("launcher closed");
     }
     closed
 }
 
-fn open(cx: &mut App) -> Result<AnyWindowHandle> {
+/// Opens the window, returning it and its `window.kind` attribute.
+fn open(cx: &mut App) -> Result<(AnyWindowHandle, &'static str)> {
     let build = |window: &mut Window, cx: &mut App| cx.new(|cx| LauncherView::new(window, cx));
 
     // Not every compositor implements layer shell (GNOME does not).
     #[cfg(target_os = "linux")]
     match open_window(window_options(layer_shell_kind(), cx), cx, build) {
-        Ok((handle, _)) => return Ok(handle),
-        Err(error) => log::warn!("layer-shell window unavailable, using a popup window: {error:#}"),
+        Ok((handle, _)) => return Ok((handle, "layer_shell")),
+        Err(error) => {
+            tracing::warn!("layer-shell window unavailable, using a popup window: {error:#}")
+        }
     }
 
-    open_window(window_options(WindowKind::PopUp, cx), cx, build).map(|(handle, _)| handle)
+    open_window(window_options(WindowKind::PopUp, cx), cx, build)
+        .map(|(handle, _)| (handle, "popup"))
 }
 
 fn window_options(kind: WindowKind, cx: &App) -> WindowOptions {
@@ -103,6 +190,9 @@ fn layer_shell_kind() -> WindowKind {
 
 struct LauncherView {
     focus_handle: FocusHandle,
+    opened_at: Instant,
+    /// Set when the view closes its own window; anything else is [`CloseReason::Toggled`].
+    close_reason: Option<CloseReason>,
     /// Set once the window has gained focus, so the deactivation that can precede
     /// the first activation does not close the window immediately.
     was_active: bool,
@@ -119,19 +209,35 @@ impl LauncherView {
             if window.is_window_active() {
                 this.was_active = true;
             } else if this.was_active {
+                this.close_reason = Some(CloseReason::FocusLost);
                 window.remove_window();
             }
         });
 
         Self {
             focus_handle,
+            opened_at: Instant::now(),
+            close_reason: None,
             was_active: false,
             _activation: activation,
         }
     }
 
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, _: &mut Context<Self>) {
+        self.close_reason = Some(CloseReason::Escape);
         window.remove_window();
+    }
+}
+
+/// The view is released with its window, however that closed.
+impl Drop for LauncherView {
+    fn drop(&mut self) {
+        let reason = self.close_reason.unwrap_or(CloseReason::Toggled);
+        metrics::duration(
+            "hermit.launcher.visible.duration",
+            self.opened_at.elapsed(),
+            &[("close.reason", reason.as_str())],
+        );
     }
 }
 

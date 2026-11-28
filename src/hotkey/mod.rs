@@ -20,22 +20,39 @@ pub struct HotkeyListener {
     _task: Task<()>,
 }
 
-/// Registers the global hotkey and calls `on_press` on the main thread each time it is pressed.
+/// Registers the global hotkey and calls `on_press` on the main thread each time it
+/// is pressed. When the hotkey cannot be registered, logs why and calls
+/// `on_unavailable` once on the main thread; on Linux that happens later, once the
+/// desktop portal has answered.
 pub fn listen(
     cx: &mut App,
     on_press: impl Fn(&mut App) + 'static,
-) -> anyhow::Result<HotkeyListener> {
+    on_unavailable: impl FnOnce(&mut App) + 'static,
+) -> HotkeyListener {
     #[cfg(target_os = "linux")]
-    return Ok(HotkeyListener {
-        _task: portal::listen(cx, on_press),
-    });
+    return HotkeyListener {
+        _task: portal::listen(cx, on_press, on_unavailable),
+    };
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    return native::listen(cx, on_press).map(|task| HotkeyListener { _task: task });
+    return match native::listen(cx, on_press) {
+        Ok(task) => HotkeyListener { _task: task },
+        Err(error) => {
+            tracing::error!("could not register the global hotkey: {error:#}");
+            on_unavailable(cx);
+            HotkeyListener {
+                _task: Task::ready(()),
+            }
+        }
+    };
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        let _ = (cx, on_press);
-        anyhow::bail!("global hotkeys are not supported on this platform")
+        let _ = on_press;
+        tracing::error!("global hotkeys are not supported on this platform");
+        on_unavailable(cx);
+        HotkeyListener {
+            _task: Task::ready(()),
+        }
     }
 }

@@ -5,6 +5,7 @@ use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui_kit::{App, Task};
 use ksni::TrayMethods as _;
 use ksni::menu::StandardItem;
+use tracing::Instrument as _;
 
 use super::TrayAction;
 use crate::icon::RgbaImage;
@@ -78,13 +79,18 @@ pub(super) fn spawn(
         actions: sender,
     };
 
+    // Created here, so it is a child of the startup span although it finishes later.
+    let registration = tracing::info_span!("tray.register", backend = "status-notifier-item");
     cx.spawn(async move |cx| {
-        let handle = match tray.spawn().await {
-            Ok(handle) => handle,
-            Err(error) => {
-                log::error!("could not show the tray icon: {error}");
-                return;
-            }
+        let registered = async {
+            tray.spawn()
+                .await
+                .inspect_err(|error| tracing::error!("could not show the tray icon: {error}"))
+        }
+        .instrument(registration)
+        .await;
+        let Ok(handle) = registered else {
+            return;
         };
 
         while let Some(action) = actions.next().await {

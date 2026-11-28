@@ -5,11 +5,13 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.105"
-env_logger = "0.11.12"
+dotenvy = "0.15.7"
 futures = "0.3.34"
 gpui-kit = { version = "0.11.0", default-features = false, features = ["component", "assets", "gpui-fast"] }
-log = "0.4.35"
 png = "0.18"
+sentry = { version = "0.49.6", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "logs", "metrics", "release-health", "tracing", "ureq", "rustls"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts"] }

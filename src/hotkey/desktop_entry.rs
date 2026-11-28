@@ -8,6 +8,8 @@ use std::{env, fs};
 
 use anyhow::Context as _;
 
+use crate::telemetry::private_path;
+
 /// Writes `$XDG_DATA_HOME/applications/<APP_ID>.desktop`, pointing at the running
 /// executable. Leaves the file alone when it is already up to date.
 pub(super) fn ensure_installed() -> anyhow::Result<()> {
@@ -27,10 +29,10 @@ pub(super) fn ensure_installed() -> anyhow::Result<()> {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", private_path(parent)))?;
     }
-    fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
-    log::info!("installed desktop entry at {}", path.display());
+    fs::write(&path, contents).with_context(|| format!("writing {}", private_path(&path)))?;
+    tracing::info!("installed desktop entry at {}", private_path(&path));
     Ok(())
 }
 

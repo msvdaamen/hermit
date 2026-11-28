@@ -1,1 +1,3 @@
 /target
+# Local secrets (e.g. Grafana Cloud credentials)
+.env

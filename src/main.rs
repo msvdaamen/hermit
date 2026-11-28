@@ -5,6 +5,7 @@ mod hotkey;
 mod icon;
 mod launcher;
 mod single_instance;
+mod telemetry;
 mod tray;
 
 use gpui_kit::*;
@@ -27,16 +28,29 @@ struct TrayRegistration {
 impl Global for TrayRegistration {}
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("hermit=info"))
-        .init();
+    let dotenv = cfg!(debug_assertions).then(dotenvy::dotenv);
+
+    let telemetry = telemetry::init();
+
+    match dotenv {
+        Some(Ok(path)) => {
+            tracing::info!("loaded settings from {}", telemetry::private_path(&path));
+        }
+        Some(Err(error)) if !error.not_found() => {
+            tracing::warn!("could not load .env: {error}");
+        }
+        Some(Err(_)) | None => {}
+    }
 
     // GPUI is built with its Wayland backend only; without a compositor it would
     // silently start headless, with no way to show the launcher.
     #[cfg(target_os = "linux")]
     if std::env::var_os("WAYLAND_DISPLAY").is_none_or(|display| display.is_empty()) {
-        log::error!(
+        tracing::error!(
             "Hermit needs a Wayland session (WAYLAND_DISPLAY is not set); X11 is not supported."
         );
+        // `exit` skips destructors, so flush explicitly.
+        drop(telemetry);
         std::process::exit(1);
     }
 
@@ -45,11 +59,11 @@ fn main() {
     let _instance_lock = match single_instance::acquire() {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
-            log::info!("Hermit is already running.");
+            tracing::info!("Hermit is already running.");
             return;
         }
         Err(error) => {
-            log::warn!("could not check for a running Hermit: {error:#}");
+            tracing::warn!("could not check for a running Hermit: {error:#}");
             None
         }
     };
@@ -58,30 +72,42 @@ fn main() {
         .with_assets(assets::Assets)
         // Hermit lives in the background: closing the launcher must not quit the app.
         .with_quit_mode(QuitMode::Explicit)
-        .run(|cx| {
+        .run(move |cx| {
+            // Flush before the process exits; on macOS quitting never returns from `run`.
+            // GPUI polls this future only after closing the windows, so the metrics the
+            // launcher records when it closes are flushed too.
+            let mut telemetry = Some(telemetry);
+            cx.on_app_quit(move |_| {
+                let telemetry = telemetry.take();
+                async move {
+                    if let Some(mut telemetry) = telemetry {
+                        telemetry.shutdown();
+                    }
+                }
+            })
+            .detach();
+
+            let _startup = tracing::info_span!("startup").entered();
             init(cx);
             launcher::init(cx);
 
             match tray::spawn(cx, |action, cx| match action {
-                tray::TrayAction::Open => launcher::show(cx),
+                tray::TrayAction::Open => launcher::show(launcher::Trigger::Tray, cx),
                 tray::TrayAction::Quit => cx.quit(),
             }) {
                 Ok(icon) => cx.set_global(TrayRegistration { _icon: icon }),
-                Err(error) => log::error!("could not show the tray icon: {error:#}"),
+                Err(error) => tracing::error!("could not show the tray icon: {error:#}"),
             }
 
-            match hotkey::listen(cx, launcher::toggle) {
-                Ok(listener) => {
-                    log::info!("Hermit is running in the background.");
-                    cx.set_global(HotkeyRegistration {
-                        _listener: listener,
-                    });
-                }
-                Err(error) => {
-                    log::error!("could not register the global hotkey: {error:#}");
-                    // Without a hotkey there is no other way in, so show the launcher now.
-                    launcher::toggle(cx);
-                }
-            }
+            let listener = hotkey::listen(
+                cx,
+                |cx| launcher::toggle(launcher::Trigger::Hotkey, cx),
+                // Without a hotkey there is no other way in, so show the launcher now.
+                |cx| launcher::show(launcher::Trigger::Startup, cx),
+            );
+            cx.set_global(HotkeyRegistration {
+                _listener: listener,
+            });
+            tracing::info!("Hermit is running in the background.");
         });
 }

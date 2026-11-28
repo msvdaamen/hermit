@@ -49,6 +49,29 @@ rsvg-convert -w 64 -h 64 assets/icon.svg -o assets/icon.png
 
 Only one Hermit runs at a time: starting it again while it is running just exits.
 
+### Telemetry
+
+Hermit reports to [Sentry](https://sentry.io/): crashes (panics), errors, traces (startup, hotkey and tray registration, opening the launcher), its log lines (linked to those traces), release-health sessions, and launcher metrics (`hermit.launcher.opens`, `hermit.launcher.open.duration`, `hermit.launcher.visible.duration`). Code records spans and events with [`tracing`](https://docs.rs/tracing); `src/telemetry.rs` routes them to Sentry, and is the only place that uses the Sentry SDK. Metrics go through `telemetry::metrics`, because `tracing` has no metrics API.
+
+About the machine, Hermit sends the app version, OS and version, and CPU architecture; it does not send the host name or IP address. File paths in log lines and crash reports show the home directory as `~`, so user names are not sent.
+
+Hermit sends to the first DSN it finds:
+
+1. `SENTRY_DSN` at runtime. Set but empty, it turns telemetry off, even in a build with a built-in DSN.
+2. `HERMIT_SENTRY_DSN` set at **compile time**:
+
+   ```sh
+   HERMIT_SENTRY_DSN=https://<key>@<org>.ingest.<region>.sentry.io/<project> cargo build --release
+   ```
+
+Without either, nothing is sent. Find the DSN in Sentry under **Settings → Projects → hermit → Client Keys (DSN)**. A DSN can only send events, but anyone with a copy of Hermit can read it out of the binary and send junk to the project. Sentry's per-key rate limits (on the same page) cap the damage; if it gets abused, revoke the key and build with a new one.
+
+Events are tagged with environment `development` in debug builds and `production` in release builds (`SENTRY_ENVIRONMENT` overrides it), and with release `hermit@<version>`. Spans and logs from Hermit's own code are sent at `debug` and above in debug builds, `info` and above in release builds; `error!` events also open Sentry issues. Debug builds send every trace, release builds a random 10% (sampled per trace, so a trace arrives whole or not at all). Errors, crashes, logs and metrics are always sent in full.
+
+`RUST_LOG` controls what is printed to stderr (default `hermit=info`); it does not change what is sent.
+
+To send from a debug build, put a DSN in `.env`: debug builds load it at startup from the working directory or a parent (release builds never do). Copy [`.env.example`](.env.example) to `.env`, which git ignores, and fill it in. Variables already set in your shell take precedence. Use a separate Sentry project for development, or filter by the `development` environment.
+
 ### Build and run
 
 ```sh
@@ -73,10 +96,11 @@ src/
   tray/          # Tray icon and menu: ksni (Linux), tray-icon crate (macOS, Windows)
   icon.rs        # Decodes the embedded app icon (assets/icon.png)
   single_instance.rs  # Lock file that keeps a second Hermit from starting
+  hotkey/        # Global hotkey: XDG portal (Wayland), global-hotkey crate (macOS, Windows)
+  telemetry.rs   # tracing subscriber and Sentry
 assets/
   icon.svg       # App and tray icon (source)
   icon.png       # 64px render of icon.svg, embedded in the binary
-  hotkey/        # Global hotkey: XDG portal (Wayland), global-hotkey crate (macOS, Windows)
 .agents/skills/  # Agent skills for AI coding assistants (gpui-kit guides)
 ```
 
