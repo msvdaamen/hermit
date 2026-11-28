@@ -3550,6 +3550,7 @@ dependencies = [
  "gpui-kit",
  "ksni",
  "png 0.18.1",
+ "rustix",
  "sentry",
  "tracing",
  "tracing-subscriber",

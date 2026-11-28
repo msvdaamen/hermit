@@ -1,11 +1,13 @@
 // Release builds on Windows run without a console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod components;
 mod hotkey;
 mod icon;
 mod launcher;
 mod single_instance;
 mod telemetry;
+mod theme;
 mod tray;
 
 use gpui_kit::*;
@@ -56,7 +58,8 @@ fn main() {
 
     // Held until the process exits. A lock that cannot be taken for another reason
     // (e.g. an unwritable directory) should not stop Hermit from starting.
-    let _instance_lock = match single_instance::acquire() {
+    // A development build replaces the running instance, so a rebuild takes effect.
+    let _instance_lock = match single_instance::acquire(cfg!(debug_assertions)) {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
             tracing::info!("Hermit is already running.");
@@ -89,6 +92,7 @@ fn main() {
 
             let _startup = tracing::info_span!("startup").entered();
             init(cx);
+            theme::init(cx);
             launcher::init(cx);
 
             match tray::spawn(cx, |action, cx| match action {

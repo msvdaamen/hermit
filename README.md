@@ -4,7 +4,7 @@ A fast, keyboard-driven launcher for **Linux (Wayland), macOS and Windows**, ins
 
 Raycast is a great productivity tool, but it doesn't run on Linux. Hermit aims to bring the same experience to every platform: press a hotkey, type a few characters, and get things done without reaching for the mouse.
 
-> **Status:** early development. Hermit runs in the background with a tray icon, and a global hotkey toggles a placeholder window. Everything else listed under [Goals](#goals) is planned, not yet built.
+> **Status:** early development. Hermit runs in the background with a tray icon, and a global hotkey toggles the launcher: a translucent, blurred window with a search field that does not search anything yet. Everything else listed under [Goals](#goals) is planned, not yet built.
 
 ## Goals
 
@@ -47,7 +47,7 @@ The icon's source is `assets/icon.svg`. After editing it, re-render the PNG the 
 rsvg-convert -w 64 -h 64 assets/icon.svg -o assets/icon.png
 ```
 
-Only one Hermit runs at a time: starting it again while it is running just exits.
+Only one Hermit runs at a time: starting it again while it is running just exits. A development (debug) build on Linux instead stops the running Hermit and takes its place, so `cargo run` always runs the code you just built.
 
 ### Telemetry
 

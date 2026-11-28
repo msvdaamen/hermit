@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1.0.105"
 dotenvy = "0.15.7"
 futures = "0.3.34"
-gpui-kit = { version = "0.11.0", default-features = false, features = ["component", "assets", "gpui-fast"] }
+gpui-kit = { version = "0.11.0", default-features = false, features = ["assets", "gpui-fast"] }
 png = "0.18"
 sentry = { version = "0.49.6", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "logs", "metrics", "release-health", "tracing", "ureq", "rustls"] }
 tracing = "0.1.44"
@@ -16,6 +16,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts"] }
 ksni = { version = "0.3", default-features = false, features = ["async-io"] }
+rustix = { version = "1.1.6", features = ["process"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 global-hotkey = "0.10.0"
