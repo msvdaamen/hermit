@@ -4,7 +4,7 @@ A fast, keyboard-driven launcher for **Linux (Wayland), macOS and Windows**, ins
 
 Raycast is a great productivity tool, but it doesn't run on Linux. Hermit aims to bring the same experience to every platform: press a hotkey, type a few characters, and get things done without reaching for the mouse.
 
-> **Status:** early development. Hermit runs in the background with a tray icon, and a global hotkey toggles a placeholder window. Everything else listed under [Goals](#goals) is planned, not yet built.
+> **Status:** early development. Hermit runs in the background with a tray icon, and a global hotkey toggles the launcher: a translucent, blurred window with a search field that does not search anything yet. Everything else listed under [Goals](#goals) is planned, not yet built.
 
 ## Goals
 
@@ -47,7 +47,7 @@ The icon's source is `assets/icon.svg`. After editing it, re-render the PNG the 
 rsvg-convert -w 64 -h 64 assets/icon.svg -o assets/icon.png
 ```
 
-Only one Hermit runs at a time: starting it again while it is running just exits.
+Only one Hermit runs at a time: starting it again while it is running just exits. A development (debug) build on Linux instead stops the running Hermit and takes its place, so `cargo run` always runs the code you just built. It stops only a process whose executable is also named `hermit`, so a stale process id in the lock file never ends an unrelated program. On Linux and macOS, Hermit quits cleanly on `SIGTERM` and `Ctrl+C` (`SIGINT`), flushing its telemetry first.
 
 ### Telemetry
 
@@ -96,6 +96,7 @@ src/
   tray/          # Tray icon and menu: ksni (Linux), tray-icon crate (macOS, Windows)
   icon.rs        # Decodes the embedded app icon (assets/icon.png)
   single_instance.rs  # Lock file that keeps a second Hermit from starting
+  termination.rs # Quits cleanly on SIGTERM and SIGINT
   hotkey/        # Global hotkey: XDG portal (Wayland), global-hotkey crate (macOS, Windows)
   telemetry.rs   # tracing subscriber and Sentry
 assets/

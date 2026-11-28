@@ -2,10 +2,13 @@
 
 use std::time::Instant;
 
-use gpui_kit::component::ActiveTheme;
+use gpui_kit::base::input::InputState;
+use gpui_kit::base::v_flex;
 use gpui_kit::*;
 
+use crate::components::CommandInput;
 use crate::telemetry::metrics;
+use crate::theme::ActiveTheme;
 
 actions!(launcher, [Dismiss]);
 
@@ -165,6 +168,9 @@ fn window_options(kind: WindowKind, cx: &App) -> WindowOptions {
         window_bounds: Some(WindowBounds::centered(None, size(px(720.), px(420.)), cx)),
         titlebar: None,
         kind,
+        // Lets the compositor show (and blur) what is behind the window; the view's
+        // background alpha decides how much shows through.
+        window_background: WindowBackgroundAppearance::Blurred,
         is_movable: false,
         is_resizable: false,
         is_minimizable: false,
@@ -189,7 +195,8 @@ fn layer_shell_kind() -> WindowKind {
 }
 
 struct LauncherView {
-    focus_handle: FocusHandle,
+    /// What the user is searching for.
+    query: Entity<InputState>,
     opened_at: Instant,
     /// Set when the view closes its own window; anything else is [`CloseReason::Toggled`].
     close_reason: Option<CloseReason>,
@@ -201,8 +208,13 @@ struct LauncherView {
 
 impl LauncherView {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
+        // The launcher opens ready to type into. Nothing else in it takes focus, so
+        // clicking elsewhere in the window leaves the search field focused.
+        let query =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search apps and commands…"));
+        window.focus(&query.focus_handle(cx), cx);
+
+        window.set_client_corner_radii(Corners::all(cx.theme().window_radius));
 
         // Close when the user clicks or switches away, like other launchers.
         let activation = cx.observe_window_activation(window, |this, window, _| {
@@ -215,7 +227,7 @@ impl LauncherView {
         });
 
         Self {
-            focus_handle,
+            query,
             opened_at: Instant::now(),
             close_reason: None,
             was_active: false,
@@ -243,17 +255,23 @@ impl Drop for LauncherView {
 
 impl Render for LauncherView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .track_focus(&self.focus_handle)
+        // No `track_focus` here: a focusable root would take focus from the search
+        // field on every click. Escape reaches `dismiss` through the field, which
+        // lets it propagate when there is nothing to clear.
+        v_flex()
             .key_context(CONTEXT)
             .on_action(cx.listener(Self::dismiss))
             .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .text_xl()
-            .child("Hello, World!")
+            .rounded(cx.theme().window_radius)
+            .child(
+                div()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(CommandInput::new(&self.query)),
+            )
+            // Results go here.
+            .child(div().flex_1())
     }
 }
